@@ -1,0 +1,4 @@
+[workspace]
+default-members = ["cli", "aglio"]
+members = ["cli", "aglio"]
+resolver = "3"

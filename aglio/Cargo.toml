@@ -1,0 +1,10 @@
+[package]
+name = "aglio"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+serde = "1"
+crc = "3.3.0"
+
+thiserror = "2"
