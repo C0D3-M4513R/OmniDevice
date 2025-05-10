@@ -1,3 +1,4 @@
+#![allow(unused_variables)] //Todo: get rid of those
 use std::fmt::Display;
 use std::marker::PhantomData;
 use std::str::Utf8Error;
@@ -10,17 +11,26 @@ pub enum Endianess {
     Little,
     Big,
 }
-pub struct AglioConfig<'a, S: TryFrom<usize> + Serialize + DeserializeOwned + TryInto<usize>, W: crc::Width + Clone, I: crc::Implementation<Data<W>: Clone> + Clone = crc::Table<1> > {
+pub struct AglioConfig<'a, S: TryFrom<usize> + Serialize + DeserializeOwned + TryInto<usize>, W: crc::Width> {
     pub endianess: Endianess,
     pub packet_start: &'a [u8],
-    pub body_crc: Option<crc::Crc<W, I>>,
+    pub body_crc: Option<&'static crc::Algorithm<W>>,
     pub phantom_data: PhantomData<S>,
 }
 impl<'a, S: TryFrom<usize> + Serialize + DeserializeOwned + TryInto<usize>, > AglioConfig<'a, S, u16> {
     const DEFAULT: Self = Self {
         endianess: Endianess::Little,
         packet_start: &[0xAA, 0x55],
-        body_crc: Some(crc::Crc::<u16>::new(&crc::CRC_16_USB)),
+        body_crc: Some(&crc::Algorithm{
+            width: 16,
+            poly: 0x1021, //4129 decimal
+            init: 0xffff,
+            refin: false,
+            refout: false,
+            xorout: 0x0,
+            check: 0x0041,
+            residue: 0xffff,
+        }),
         phantom_data: PhantomData,
     };
 }
@@ -29,12 +39,12 @@ impl<'a, S: TryFrom<usize> + Serialize + DeserializeOwned + TryInto<usize>, > De
         AglioConfig::DEFAULT
     }
 }
-impl<'a, S: TryFrom<usize> + Serialize + DeserializeOwned + TryInto<usize>, W: crc::Width + Clone, I: crc::Implementation<Data<W>: Clone> + Clone> Clone for AglioConfig<'a, S, W, I> {
+impl<'a, S: TryFrom<usize> + Serialize + DeserializeOwned + TryInto<usize>, W: crc::Width> Clone for AglioConfig<'a, S, W> {
     fn clone(&self) -> Self {
         Self {
             endianess: self.endianess,
             packet_start: self.packet_start,
-            body_crc: self.body_crc.clone(),
+            body_crc: self.body_crc,
             phantom_data: PhantomData,
         }
     }
@@ -45,7 +55,7 @@ impl<'a, S: TryFrom<usize> + Serialize + DeserializeOwned + TryInto<usize>, W: c
 pub enum SerializeError {
     #[error("Cannot automatically infer data type")]
     NotDescriptive,
-    #[error("Array, String or Sequence is too long")]
+    #[error("Array, String, Sequence or enum is too long")]
     TooLong,
     #[error("{0}")]
     Custom(String),
@@ -65,13 +75,13 @@ pub fn serialize<S: serde::Serialize>(value: &S) -> Result<Vec<u8>, SerializeErr
     serialize_with_config(AglioConfig::<u32, u16>::DEFAULT, value)
 }
 
-pub fn serialize_with_config<'a, S: serde::Serialize, Size: TryFrom<usize> + Serialize + DeserializeOwned + TryInto<usize>, >(config: AglioConfig<'a, Size, u16, crc::Table<1>>, value: &S) -> Result<Vec<u8>, SerializeError> {
-    struct AglioSerializer<'a, W: crc::Width + Clone, I: crc::Implementation<Data<W>: Clone> + Clone, S: TryFrom<usize> + Serialize + DeserializeOwned + TryInto<usize>, > {
-        config: AglioConfig<'a, S, W, I>,
+pub fn serialize_with_config<'a, S: serde::Serialize, Size: TryFrom<usize> + Serialize + DeserializeOwned + TryInto<usize>, >(config: AglioConfig<'a, Size, u16>, value: &S) -> Result<Vec<u8>, SerializeError> {
+    struct AglioSerializer<'a, W: crc::Width, S: TryFrom<usize> + Serialize + DeserializeOwned + TryInto<usize>, > {
+        config: AglioConfig<'a, S, W>,
         data: Vec<u8>,
     }
 
-    impl<'a, W: crc::Width + Clone, I: crc::Implementation<Data<W>: Clone> + Clone, S: TryFrom<usize> + Serialize + DeserializeOwned + TryInto<usize>> AglioSerializer<'a, W, I, S> {
+    impl<'a, W: crc::Width, S: TryFrom<usize> + Serialize + DeserializeOwned + TryInto<usize>> AglioSerializer<'a, W, S> {
         fn serialize_usize_as_u32(&mut self, len: usize) -> Result<(), SerializeError> {
             match S::try_from(len) {
                 Ok(len) => {
@@ -82,13 +92,19 @@ pub fn serialize_with_config<'a, S: serde::Serialize, Size: TryFrom<usize> + Ser
                 }
             }
         }
+        fn serialize_variant(&mut self, variant: u32) -> Result<(), SerializeError> {
+            match u8::try_from(variant) {
+                Ok(variant) => self.serialize_u8(variant),
+                Err(_) => Err(SerializeError::TooLong)
+            }
+        }
     }
-    struct SerializeSeq<'de, 'a, W: crc::Width + Clone, I: crc::Implementation<Data<W>: Clone> + Clone, S: TryFrom<usize> + Serialize + DeserializeOwned + TryInto<usize>> {
+    struct SerializeSeq<'de, 'a, W: crc::Width, S: TryFrom<usize> + Serialize + DeserializeOwned + TryInto<usize>> {
         elements: usize,
-        serializer: &'de mut AglioSerializer<'a, W, I, S>,
-        intermediate_serializer: AglioSerializer<'a, W, I, S>,
+        serializer: &'de mut AglioSerializer<'a, W, S>,
+        intermediate_serializer: AglioSerializer<'a, W, S>,
     }
-    impl<'de, 'a, W: crc::Width + Clone, I: crc::Implementation<Data<W>: Clone> + Clone, S: TryFrom<usize> + Serialize + DeserializeOwned + TryInto<usize>> serde::ser::SerializeSeq for SerializeSeq<'de, 'a, W, I, S> {
+    impl<'de, 'a, W: crc::Width, S: TryFrom<usize> + Serialize + DeserializeOwned + TryInto<usize>> serde::ser::SerializeSeq for SerializeSeq<'de, 'a, W, S> {
         type Ok = ();
         type Error = SerializeError;
 
@@ -106,7 +122,7 @@ pub fn serialize_with_config<'a, S: serde::Serialize, Size: TryFrom<usize> + Ser
             Ok(())
         }
     }
-    impl<'de, 'a, W: crc::Width + Clone, I: crc::Implementation<Data<W>: Clone> + Clone, S: TryFrom<usize> + Serialize + DeserializeOwned + TryInto<usize>> serde::ser::SerializeTuple for &'de mut AglioSerializer<'a, W, I, S> {
+    impl<'de, 'a, W: crc::Width, S: TryFrom<usize> + Serialize + DeserializeOwned + TryInto<usize>> serde::ser::SerializeTuple for &'de mut AglioSerializer<'a, W, S> {
         type Ok = <Self as serde::ser::Serializer>::Ok;
         type Error = <Self as serde::ser::Serializer>::Error;
 
@@ -118,9 +134,9 @@ pub fn serialize_with_config<'a, S: serde::Serialize, Size: TryFrom<usize> + Ser
             value.serialize(&mut**self)
         }
         #[inline]
-        fn end(mut self) -> Result<Self::Ok, Self::Error> { Ok(()) }
+        fn end(self) -> Result<Self::Ok, Self::Error> { Ok(()) }
     }
-    impl<'de, 'a, W: crc::Width + Clone, I: crc::Implementation<Data<W>: Clone> + Clone, S: TryFrom<usize> + Serialize + DeserializeOwned + TryInto<usize>> serde::ser::SerializeTupleStruct for &'de mut AglioSerializer<'a, W, I, S> {
+    impl<'de, 'a, W: crc::Width, S: TryFrom<usize> + Serialize + DeserializeOwned + TryInto<usize>> serde::ser::SerializeTupleStruct for &'de mut AglioSerializer<'a, W, S> {
         type Ok = <Self as serde::ser::Serializer>::Ok;
         type Error = <Self as serde::ser::Serializer>::Error;
 
@@ -132,9 +148,9 @@ pub fn serialize_with_config<'a, S: serde::Serialize, Size: TryFrom<usize> + Ser
             value.serialize(&mut**self)
         }
         #[inline]
-        fn end(mut self) -> Result<Self::Ok, Self::Error> { Ok(()) }
+        fn end(self) -> Result<Self::Ok, Self::Error> { Ok(()) }
     }
-    impl<'de, 'a, W: crc::Width + Clone, I: crc::Implementation<Data<W>: Clone> + Clone, S: TryFrom<usize> + Serialize + DeserializeOwned + TryInto<usize>> serde::ser::SerializeTupleVariant for &'de mut AglioSerializer<'a, W, I, S> {
+    impl<'de, 'a, W: crc::Width, S: TryFrom<usize> + Serialize + DeserializeOwned + TryInto<usize>> serde::ser::SerializeTupleVariant for &'de mut AglioSerializer<'a, W, S> {
         type Ok = <Self as serde::ser::Serializer>::Ok;
         type Error = <Self as serde::ser::Serializer>::Error;
 
@@ -146,14 +162,14 @@ pub fn serialize_with_config<'a, S: serde::Serialize, Size: TryFrom<usize> + Ser
             value.serialize(&mut**self)
         }
         #[inline]
-        fn end(mut self) -> Result<Self::Ok, Self::Error> { Ok(()) }
+        fn end(self) -> Result<Self::Ok, Self::Error> { Ok(()) }
     }
-    struct SerializeMap<'de, 'a, W: crc::Width + Clone, I: crc::Implementation<Data<W>: Clone> + Clone, S: TryFrom<usize> + Serialize + DeserializeOwned + TryInto<usize>> {
+    struct SerializeMap<'de, 'a, W: crc::Width, S: TryFrom<usize> + Serialize + DeserializeOwned + TryInto<usize>> {
         elements: usize,
-        serializer: &'de mut AglioSerializer<'a, W, I, S>,
-        intermediate_serializer: AglioSerializer<'a, W, I, S>,
+        serializer: &'de mut AglioSerializer<'a, W, S>,
+        intermediate_serializer: AglioSerializer<'a, W, S>,
     }
-    impl<'de, 'a, W: crc::Width + Clone, I: crc::Implementation<Data<W>: Clone> + Clone, S: TryFrom<usize> + Serialize + DeserializeOwned + TryInto<usize>> serde::ser::SerializeMap for SerializeMap<'de, 'a, W, I, S> {
+    impl<'de, 'a, W: crc::Width, S: TryFrom<usize> + Serialize + DeserializeOwned + TryInto<usize>> serde::ser::SerializeMap for SerializeMap<'de, 'a, W, S> {
         type Ok = ();
         type Error = SerializeError;
 
@@ -178,7 +194,7 @@ pub fn serialize_with_config<'a, S: serde::Serialize, Size: TryFrom<usize> + Ser
             Ok(())
         }
     }
-    impl<'de, 'a, W: crc::Width + Clone, I: crc::Implementation<Data<W>: Clone> + Clone, S: TryFrom<usize> + Serialize + DeserializeOwned + TryInto<usize>> serde::ser::SerializeStruct for &'de mut AglioSerializer<'a, W, I, S> {
+    impl<'de, 'a, W: crc::Width, S: TryFrom<usize> + Serialize + DeserializeOwned + TryInto<usize>> serde::ser::SerializeStruct for &'de mut AglioSerializer<'a, W, S> {
         type Ok = <Self as serde::ser::Serializer>::Ok;
         type Error = <Self as serde::ser::Serializer>::Error;
 
@@ -190,9 +206,9 @@ pub fn serialize_with_config<'a, S: serde::Serialize, Size: TryFrom<usize> + Ser
             value.serialize(&mut**self)
         }
         #[inline]
-        fn end(mut self) -> Result<Self::Ok, Self::Error> { Ok(()) }
+        fn end(self) -> Result<Self::Ok, Self::Error> { Ok(()) }
     }
-    impl<'de, 'a, W: crc::Width + Clone, I: crc::Implementation<Data<W>: Clone> + Clone, S: TryFrom<usize> + Serialize + DeserializeOwned + TryInto<usize>> serde::ser::SerializeStructVariant for &'de mut AglioSerializer<'a, W, I, S> {
+    impl<'de, 'a, W: crc::Width, S: TryFrom<usize> + Serialize + DeserializeOwned + TryInto<usize>> serde::ser::SerializeStructVariant for &'de mut AglioSerializer<'a, W, S> {
         type Ok = <Self as serde::ser::Serializer>::Ok;
         type Error = <Self as serde::ser::Serializer>::Error;
 
@@ -204,18 +220,18 @@ pub fn serialize_with_config<'a, S: serde::Serialize, Size: TryFrom<usize> + Ser
             value.serialize(&mut**self)
         }
         #[inline]
-        fn end(mut self) -> Result<Self::Ok, Self::Error> { Ok(()) }
+        fn end(self) -> Result<Self::Ok, Self::Error> { Ok(()) }
     }
-    impl<'de, 'a, W: crc::Width + Clone, I: crc::Implementation<Data<W>: Clone> + Clone, S: TryFrom<usize> + Serialize + DeserializeOwned + TryInto<usize>> serde::Serializer for &'de mut AglioSerializer<'a, W, I, S> {
+    impl<'de, 'a, W: crc::Width, S: TryFrom<usize> + Serialize + DeserializeOwned + TryInto<usize>> serde::Serializer for &'de mut AglioSerializer<'a, W, S> {
         type Ok = ();
         type Error = SerializeError;
-        type SerializeSeq = SerializeSeq<'de, 'a, W, I, S>;
-        type SerializeTuple = &'de mut AglioSerializer<'a, W, I, S>;
-        type SerializeTupleStruct = &'de mut AglioSerializer<'a, W, I, S>;
-        type SerializeTupleVariant = &'de mut AglioSerializer<'a, W, I, S>;
-        type SerializeMap = SerializeMap<'de, 'a, W, I, S>;
-        type SerializeStruct = &'de mut AglioSerializer<'a, W, I, S>;
-        type SerializeStructVariant = &'de mut AglioSerializer<'a, W, I, S>;
+        type SerializeSeq = SerializeSeq<'de, 'a, W, S>;
+        type SerializeTuple = &'de mut AglioSerializer<'a, W, S>;
+        type SerializeTupleStruct = &'de mut AglioSerializer<'a, W, S>;
+        type SerializeTupleVariant = &'de mut AglioSerializer<'a, W, S>;
+        type SerializeMap = SerializeMap<'de, 'a, W, S>;
+        type SerializeStruct = &'de mut AglioSerializer<'a, W, S>;
+        type SerializeStructVariant = &'de mut AglioSerializer<'a, W, S>;
 
         fn serialize_bool(self, v: bool) -> Result<Self::Ok, Self::Error> {
             self.data.push(u8::from(v));
@@ -345,7 +361,7 @@ pub fn serialize_with_config<'a, S: serde::Serialize, Size: TryFrom<usize> + Ser
         fn serialize_unit_struct(self, name: &'static str) -> Result<Self::Ok, Self::Error> { Ok(()) }
 
         #[inline]
-        fn serialize_unit_variant(self, name: &'static str, variant_index: u32, variant: &'static str) -> Result<Self::Ok, Self::Error> { self.serialize_u32(variant_index) }
+        fn serialize_unit_variant(self, name: &'static str, variant_index: u32, variant: &'static str) -> Result<Self::Ok, Self::Error> { self.serialize_variant(variant_index) }
 
         #[inline]
         fn serialize_newtype_struct<T>(self, name: &'static str, value: &T) -> Result<Self::Ok, Self::Error>
@@ -357,7 +373,7 @@ pub fn serialize_with_config<'a, S: serde::Serialize, Size: TryFrom<usize> + Ser
         where
             T: ?Sized + Serialize
         {
-            self.serialize_u32(variant_index)?;
+            self.serialize_variant(variant_index)?;
             value.serialize(self)
         }
 
@@ -384,6 +400,7 @@ pub fn serialize_with_config<'a, S: serde::Serialize, Size: TryFrom<usize> + Ser
 
         #[inline]
         fn serialize_tuple_variant(self, name: &'static str, variant_index: u32, variant: &'static str, len: usize) -> Result<Self::SerializeTupleVariant, Self::Error> {
+            self.serialize_variant(variant_index)?;
             Ok(self)
         }
 
@@ -405,6 +422,7 @@ pub fn serialize_with_config<'a, S: serde::Serialize, Size: TryFrom<usize> + Ser
 
         #[inline]
         fn serialize_struct_variant(self, name: &'static str, variant_index: u32, variant: &'static str, len: usize) -> Result<Self::SerializeStructVariant, Self::Error> {
+            self.serialize_variant(variant_index)?;
             Ok(self)
         }
 
@@ -412,33 +430,39 @@ pub fn serialize_with_config<'a, S: serde::Serialize, Size: TryFrom<usize> + Ser
             false
         }
     }
+    let mut data = Vec::with_capacity(config.packet_start.len() + 2);
+    data.extend_from_slice(config.packet_start);
+    data.extend_from_slice(&0u16.to_le_bytes());
     let mut serializer = AglioSerializer{
-        config: config.clone(),
-        data: Vec::new()
+        config,
+        data
     };
     value.serialize(&mut serializer)?;
-    let mut final_data = Vec::with_capacity(serializer.data.len() + config.packet_start.len() + if config.body_crc.is_some() { core::mem::size_of::<u16>() } else { 0 });
-    final_data.extend_from_slice(config.packet_start);
-    match u32::try_from(serializer.data.len()) {
+    match u16::try_from(serializer.data.len() - serializer.config.packet_start.len()) {
         Ok(len) => {
-            match config.endianess {
-                Endianess::Little => final_data.extend_from_slice(&len.to_le_bytes()),
-                Endianess::Big => final_data.extend_from_slice(&len.to_be_bytes()),
-            }
+            let data = match serializer.config.endianess {
+                Endianess::Little => len.to_le_bytes(),
+                Endianess::Big => len.to_be_bytes(),
+            };
+            serializer.data[serializer.config.packet_start.len()..serializer.config.packet_start.len()+core::mem::size_of::<u16>()].copy_from_slice(&data);
         }
         Err(_) => {
             return Err(SerializeError::TooLong);
         }
     }
-    let crc = config.body_crc.map(|v|v.checksum(serializer.data.as_slice()));
-    final_data.append(&mut serializer.data);
-    if let Some(crc) = crc {
-        match config.endianess {
-            Endianess::Little => final_data.extend_from_slice(&crc.to_le_bytes()),
-            Endianess::Big => final_data.extend_from_slice(&crc.to_be_bytes()),
+
+    match serializer.config.body_crc {
+        Some(v) => {
+            let crc = crc::Crc::<u16>::new(v).checksum(serializer.data.as_slice());
+            match serializer.config.endianess {
+                Endianess::Little => serializer.data.extend_from_slice(&crc.to_le_bytes()),
+                Endianess::Big => serializer.data.extend_from_slice(&crc.to_be_bytes()),
+            }
         }
-    };
-    Ok(final_data)
+        None =>{},
+    }
+
+    Ok(serializer.data)
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -475,9 +499,9 @@ impl serde::de::Error for DeserializeError{
 pub fn deserialize<'de, S: serde::Deserialize<'de>>(data: &'de[u8]) -> Result<S, DeserializeError> {
     deserialize_with_config(AglioConfig::<u32, u16>::DEFAULT, data)
 }
-pub fn deserialize_with_config<'de, 'a, S: serde::Deserialize<'de>, Size: TryFrom<usize> + Serialize + DeserializeOwned + TryInto<usize>>(config: AglioConfig<'a, Size, u16, crc::Table<1>>, data: &'de[u8]) -> Result<S, DeserializeError> {
-    struct AglioDeserializer<'de, 'a, Size: TryFrom<usize> + Serialize + DeserializeOwned + TryInto<usize>, W: crc::Width + Clone, I: crc::Implementation<Data<W>: Clone> + Clone> {
-        config: AglioConfig<'a, Size, W, I>,
+pub fn deserialize_with_config<'de, 'a, S: serde::Deserialize<'de>, Size: TryFrom<usize> + Serialize + DeserializeOwned + TryInto<usize>>(config: AglioConfig<'a, Size, u16>, data: &'de[u8]) -> Result<S, DeserializeError> {
+    struct AglioDeserializer<'de, 'a, Size: TryFrom<usize> + Serialize + DeserializeOwned + TryInto<usize>, W: crc::Width> {
+        config: AglioConfig<'a, Size, W>,
         data: &'de[u8],
     }
     
@@ -504,7 +528,7 @@ pub fn deserialize_with_config<'de, 'a, S: serde::Deserialize<'de>, Size: TryFro
             }
         };
     }
-    impl<'de, 'a, W: crc::Width + Clone, I: crc::Implementation<Data<W>: Clone> + Clone, Size: TryFrom<usize> + Serialize + DeserializeOwned + TryInto<usize>> AglioDeserializer<'de, 'a, Size, W, I> {
+    impl<'de, 'a, W: crc::Width, Size: TryFrom<usize> + Serialize + DeserializeOwned + TryInto<usize>> AglioDeserializer<'de, 'a, Size, W> {
         fn get_usize(&mut self) -> Result<usize, DeserializeError> {
             match Size::deserialize(&mut*self)?.try_into() {
                 Ok(v) => Ok(v),
@@ -512,7 +536,7 @@ pub fn deserialize_with_config<'de, 'a, S: serde::Deserialize<'de>, Size: TryFro
             }
         }
     }
-    impl<'de, 'a, W: crc::Width + Clone, I: crc::Implementation<Data<W>: Clone> + Clone, Size: TryFrom<usize> + Serialize + DeserializeOwned + TryInto<usize>> serde::Deserializer<'de> for &mut AglioDeserializer<'de, 'a, Size, W, I> {
+    impl<'de, 'a, W: crc::Width, Size: TryFrom<usize> + Serialize + DeserializeOwned + TryInto<usize>> serde::Deserializer<'de> for &mut AglioDeserializer<'de, 'a, Size, W> {
         type Error = DeserializeError;
 
         fn deserialize_any<V>(self, visitor: V) -> Result<V::Value, Self::Error>
@@ -684,11 +708,11 @@ pub fn deserialize_with_config<'de, 'a, S: serde::Deserialize<'de>, Size: TryFro
             V: Visitor<'de>
         {
             let size = self.get_usize()?;
-            struct SeqAccess<'a, 'de, 'b, W: crc::Width + Clone, I: crc::Implementation<Data<W>: Clone> + Clone, Size: TryFrom<usize> + Serialize + DeserializeOwned + TryInto<usize>> {
+            struct SeqAccess<'a, 'de, 'b, W: crc::Width, Size: TryFrom<usize> + Serialize + DeserializeOwned + TryInto<usize>> {
                 elements: usize,
-                deserializer: &'a mut AglioDeserializer<'de, 'b, Size, W, I>,
+                deserializer: &'a mut AglioDeserializer<'de, 'b, Size, W>,
             }
-            impl<'a, 'de, 'b, W: crc::Width + Clone, I: crc::Implementation<Data<W>: Clone> + Clone, Size: TryFrom<usize> + Serialize + DeserializeOwned + TryInto<usize>> serde::de::SeqAccess<'de> for SeqAccess<'a, 'de, 'b, W, I, Size> {
+            impl<'a, 'de, 'b, W: crc::Width, Size: TryFrom<usize> + Serialize + DeserializeOwned + TryInto<usize>> serde::de::SeqAccess<'de> for SeqAccess<'a, 'de, 'b, W, Size> {
                 type Error = DeserializeError;
 
                 fn next_element_seed<T>(&mut self, seed: T) -> Result<Option<T::Value>, Self::Error>
@@ -717,12 +741,35 @@ pub fn deserialize_with_config<'de, 'a, S: serde::Deserialize<'de>, Size: TryFro
         fn deserialize_tuple<V>(self, len: usize, visitor: V) -> Result<V::Value, Self::Error>
         where
             V: Visitor<'de>
-        { self.deserialize_seq(visitor) }
+        {
+            struct SeqAccess<'a, 'de, 'b, W: crc::Width, Size: TryFrom<usize> + Serialize + DeserializeOwned + TryInto<usize>> {
+                deserializer: &'a mut AglioDeserializer<'de, 'b, Size, W>,
+            }
+            impl<'a, 'de, 'b, W: crc::Width, Size: TryFrom<usize> + Serialize + DeserializeOwned + TryInto<usize>> serde::de::SeqAccess<'de> for SeqAccess<'a, 'de, 'b, W, Size> {
+                type Error = DeserializeError;
 
+                fn next_element_seed<T>(&mut self, seed: T) -> Result<Option<T::Value>, Self::Error>
+                where
+                    T: DeserializeSeed<'de>
+                {
+                    seed.deserialize(&mut *self.deserializer).map(Some)
+                }
+
+                fn size_hint(&self) -> Option<usize> {
+                    None
+                }
+            }
+
+            visitor.visit_seq(SeqAccess{
+                deserializer: self,
+            })
+        }
+
+        #[inline]
         fn deserialize_tuple_struct<V>(self, name: &'static str, len: usize, visitor: V) -> Result<V::Value, Self::Error>
         where
             V: Visitor<'de>
-        { self.deserialize_seq(visitor) }
+        { self.deserialize_tuple(len, visitor) }
 
         fn deserialize_map<V>(self, visitor: V) -> Result<V::Value, Self::Error>
         where
@@ -731,21 +778,22 @@ pub fn deserialize_with_config<'de, 'a, S: serde::Deserialize<'de>, Size: TryFro
             todo!()
         }
 
+        #[inline]
         fn deserialize_struct<V>(self, name: &'static str, fields: &'static [&'static str], visitor: V) -> Result<V::Value, Self::Error>
         where
             V: Visitor<'de>
-        { visitor.visit_newtype_struct(self) }
+        { self.deserialize_tuple(fields.len(), visitor) }
 
         fn deserialize_enum<V>(self, name: &'static str, variants: &'static [&'static str], visitor: V) -> Result<V::Value, Self::Error>
         where
             V: Visitor<'de>
         {
             use serde::de::Deserializer;
-            struct VariantAccess<'a, 'de, 'b, W: crc::Width + Clone, I: crc::Implementation<Data<W>: Clone> + Clone, Size: TryFrom<usize> + Serialize + DeserializeOwned + TryInto<usize>> {
-                deserializer: &'a mut AglioDeserializer<'de, 'b, Size, W, I>,
+            struct VariantAccess<'a, 'de, 'b, W: crc::Width, Size: TryFrom<usize> + Serialize + DeserializeOwned + TryInto<usize>> {
+                deserializer: &'a mut AglioDeserializer<'de, 'b, Size, W>,
                 variant: &'static str,
             }
-            impl<'a, 'de, 'b, W: crc::Width + Clone, I: crc::Implementation<Data<W>: Clone> + Clone, Size: TryFrom<usize> + Serialize + DeserializeOwned + TryInto<usize>> serde::de::VariantAccess<'de> for VariantAccess<'a, 'de, 'b, W, I, Size> {
+            impl<'a, 'de, 'b, W: crc::Width, Size: TryFrom<usize> + Serialize + DeserializeOwned + TryInto<usize>> serde::de::VariantAccess<'de> for VariantAccess<'a, 'de, 'b, W, Size> {
                 type Error = DeserializeError;
 
                 fn unit_variant(self) -> Result<(), Self::Error> {
@@ -757,11 +805,6 @@ pub fn deserialize_with_config<'de, 'a, S: serde::Deserialize<'de>, Size: TryFro
                     T: DeserializeSeed<'de>
                 { seed.deserialize(self.deserializer) }
 
-                fn newtype_variant<T>(self) -> Result<T, Self::Error>
-                where
-                    T: Deserialize<'de>
-                { T::deserialize(self.deserializer) }
-
                 fn tuple_variant<V>(self, len: usize, visitor: V) -> Result<V::Value, Self::Error>
                 where
                     V: Visitor<'de>
@@ -772,19 +815,19 @@ pub fn deserialize_with_config<'de, 'a, S: serde::Deserialize<'de>, Size: TryFro
                     V: Visitor<'de>
                 { self.deserializer.deserialize_struct(self.variant, fields, visitor) }
             }
-            struct EnumAccess<'a, 'de, 'b, W: crc::Width + Clone, I: crc::Implementation<Data<W>: Clone> + Clone, Size: TryFrom<usize> + Serialize + DeserializeOwned + TryInto<usize>> {
-                deserializer: &'a mut AglioDeserializer<'de, 'b, Size, W, I>,
+            struct EnumAccess<'a, 'de, 'b, W: crc::Width, Size: TryFrom<usize> + Serialize + DeserializeOwned + TryInto<usize>> {
+                deserializer: &'a mut AglioDeserializer<'de, 'b, Size, W>,
                 variant: &'static str,
             }
-            impl<'a, 'de, 'b, W: crc::Width + Clone, I: crc::Implementation<Data<W>: Clone> + Clone, Size: TryFrom<usize> + Serialize + DeserializeOwned + TryInto<usize>> serde::de::EnumAccess<'de> for EnumAccess<'a, 'de, 'b, W, I, Size> {
+            impl<'a, 'de, 'b, W: crc::Width, Size: TryFrom<usize> + Serialize + DeserializeOwned + TryInto<usize>> serde::de::EnumAccess<'de> for EnumAccess<'a, 'de, 'b, W, Size> {
                 type Error = DeserializeError;
-                type Variant = VariantAccess<'a, 'de, 'b, W, I, Size>;
+                type Variant = VariantAccess<'a, 'de, 'b, W, Size>;
 
                 fn variant_seed<V>(self, seed: V) -> Result<(V::Value, Self::Variant), Self::Error>
                 where
                     V: serde::de::DeserializeSeed<'de>
                 {
-                    let out = seed.deserialize(&mut *self.deserializer);
+                    let out = seed.deserialize(serde::de::value::StrDeserializer::new(self.variant));
                     match out {
                         Err(e) => Err(e),
                         Ok(value) => {
@@ -798,7 +841,13 @@ pub fn deserialize_with_config<'de, 'a, S: serde::Deserialize<'de>, Size: TryFro
                 }
             }
 
-            let variant_index = self.get_usize()?;;
+            let variant_index = match self.data.split_first() {
+                Some((first, rest)) => {
+                    self.data = rest;
+                    *first
+                },
+                None => return Err(DeserializeError::InvalidLength),
+            };
             visitor.visit_enum(EnumAccess{
                 deserializer: self,
                 variant: match variants.get(usize::from(variant_index)) {
@@ -827,8 +876,26 @@ pub fn deserialize_with_config<'de, 'a, S: serde::Deserialize<'de>, Size: TryFro
         }
     }
 
+    //Check & Remove CRC from end of body
+    let data = if let Some(crc) = &config.body_crc {
+        match data.split_last_chunk() {
+            Some((rest, crc_value)) => {
+                let crc_value = match &config.endianess {
+                    Endianess::Little => u16::from_le_bytes(*crc_value),
+                    Endianess::Big => u16::from_be_bytes(*crc_value),
+                };
+                let checksum = crc::Crc::<u16>::new(crc).checksum(rest);
+                if  checksum != crc_value {
+                    return Err(DeserializeError::ChecksumError);
+                }
+                rest
+            }
+            None => return Err(DeserializeError::InvalidLength),
+        }
+    } else { data };
+
     //Check Packet start
-    let mut data = match data.strip_prefix(config.packet_start) {
+    let data = match data.strip_prefix(config.packet_start) {
         None => return Err(DeserializeError::InvalidPacketStart),
         Some(data) => data,
     };
@@ -837,26 +904,11 @@ pub fn deserialize_with_config<'de, 'a, S: serde::Deserialize<'de>, Size: TryFro
         config: config.clone(),
         data,
     };
+
     //Check & Remove Body size
-    let size = deserializer.get_usize()?;
-    if size != deserializer.data.len() {
+    let size = u16::deserialize(&mut deserializer)?;
+    if size as usize != deserializer.data.len() + core::mem::size_of::<u16>() {
         return Err(DeserializeError::InvalidData)
-    }
-    //Check & Remove CRC from end of body
-    if let Some(crc) = &config.body_crc {
-        match data.split_last_chunk() {
-            Some((rest, crc_value)) => {
-                data = rest;
-                let crc_value = match &config.endianess {
-                    Endianess::Little => u16::from_le_bytes(*crc_value),
-                    Endianess::Big => u16::from_be_bytes(*crc_value),
-                };
-                if crc.checksum(data) != crc_value {
-                    return Err(DeserializeError::ChecksumError);
-                }
-            }
-            None => return Err(DeserializeError::InvalidLength),
-        }
     }
 
     S::deserialize(&mut deserializer)
