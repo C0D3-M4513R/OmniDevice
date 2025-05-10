@@ -62,9 +62,9 @@ pub enum TxMessage {
 }
 #[derive(serde_derive::Serialize)]
 pub struct SetRGB {
-    r: u8,
-    g: u8,
-    b: u8,
+    pub(super) r: u8,
+    pub(super) g: u8,
+    pub(super) b: u8,
 }
 #[derive(serde_derive::Serialize)]
 pub struct SetMetaData {

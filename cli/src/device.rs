@@ -1,8 +1,10 @@
 mod messages;
 
 use std::sync::Arc;
-use tokio::sync::{Mutex, MutexGuard};
-use crate::{device, MAX_MESSAGE_SIZE, USB_PID, USB_VID};
+use std::time::Duration;
+use tokio::sync::Mutex;
+use tokio::time::MissedTickBehavior;
+use crate::{MAX_MESSAGE_SIZE, USB_PID, USB_VID};
 
 pub(super) struct DeviceList {
     list: Vec<Device>
@@ -92,6 +94,8 @@ struct Device{
     rx_queue: tokio::sync::mpsc::Receiver<messages::RxMessage>,
     tx_close: tokio::sync::oneshot::Sender<()>,
     jh: tokio::task::JoinHandle<()>,
+    tx_close_ping: tokio::sync::oneshot::Sender<()>,
+    jh_ping: tokio::task::JoinHandle<()>,
 }
 
 impl Device {
@@ -102,7 +106,7 @@ impl Device {
         let descriptor = Arc::new(descriptor);
         let device_handle = match device.open() {
             Ok(v) => Arc::new(v),
-            Err(err) => anyhow::bail!("Failed to open device: {err}")
+            Err(err) => anyhow::bail!("Failed to open device(bus = {}, address = {}, id = {}): {err}", device.bus_number(), device.address(), device.port_number())
         };
         match device_handle.set_auto_detach_kernel_driver(false) {
             Ok(()) => (),
@@ -117,6 +121,33 @@ impl Device {
 
         let (tx, rx) = tokio::sync::mpsc::channel(1024);
         let (tx_close, rx_close) = tokio::sync::oneshot::channel();
+        let (tx_close_ping, rx_close_ping) = tokio::sync::oneshot::channel();
+        let jh_ping = {
+            let device_handle2 = device_handle.clone();
+            tokio::task::spawn(async{
+                let device_handle = device_handle2;
+                let mut rx_close_ping = rx_close_ping;
+                let mut interval = tokio::time::interval(Duration::from_millis(500));
+                interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+                loop{
+                    tokio::select! {
+                        biased;
+                        _ = &mut rx_close_ping => {
+                            break;
+                        },
+                        _ = interval.tick() => {
+                            match Self::send_internal(&device_handle, &messages::TxMessage::Ping) {
+                                Ok(()) => (),
+                                Err(err) => {
+                                    eprintln!("Failed to send ping message: {err}");
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            })
+        };
         let jh = {
             let id = id.clone();
             let device_handle2 = device_handle.clone();
@@ -184,21 +215,33 @@ impl Device {
             id,
             rx_queue: rx,
             tx_close,
-            jh
+            jh,
+            tx_close_ping,
+            jh_ping,
         };
 
         device.send(&messages::TxMessage::GetId)?;
+        device.send(&messages::TxMessage::SetRGB(messages::SetRGB{
+            r: 0,
+            g: 0,
+            b: 255,
+        }))?;
         Ok(device)
     }
 
-    pub fn send(&self, message: &messages::TxMessage) -> anyhow::Result<()> {
+    fn send_internal(device_handle: &rusb::DeviceHandle<rusb::GlobalContext>, message: &messages::TxMessage) -> anyhow::Result<()> {
         match aglio::serialize(message) {
-            Ok(v) => match self.device_handle.write_bulk(1, v.as_slice(), std::time::Duration::from_secs(1)){
+            Ok(v) => match device_handle.write_bulk(1, v.as_slice(), std::time::Duration::from_secs(1)){
                 Ok(_) => Ok(()),
                 Err(err) => anyhow::bail!("Failed to write to device: {err}")
             },
             Err(err) => anyhow::bail!("Failed to serialize message: {err}")
         }
+    }
+
+    #[inline]
+    pub fn send(&self, message: &messages::TxMessage) -> anyhow::Result<()> {
+        Self::send_internal(&self.device_handle, message)
     }
     pub async fn id(&self) -> Option<messages::Id> {
         self.id.lock().await.clone()
@@ -213,5 +256,10 @@ impl Drop for Device {
         core::mem::swap(&mut self.tx_close, &mut tx);
         tx.send(()).ok();
         self.jh.abort();
+
+        let (mut tx, _) = tokio::sync::oneshot::channel();
+        core::mem::swap(&mut self.tx_close_ping, &mut tx);
+        tx.send(()).ok();
+        self.jh_ping.abort();
     }
 }
