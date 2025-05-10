@@ -18,7 +18,7 @@ pub struct Options {
     #[arg(short, long, default_value = "false")]
     ///Add if you want the file to be in a JSON format
     json: bool,
-    #[arg(short, long, default_value = "false")]
+    #[arg(short, long, default_value = "true")]
     ///Starts the websocket. To send data a UUID has to be given
     websocket: bool,
     #[arg(short, long, default_value = "8080")]

@@ -56,14 +56,24 @@ impl DeviceList {
 pub struct SerializableDevice {
     descriptor: String,
     id: Option<messages::Id>,
+    meta_data: Option<messages::MetaData>,
+    rgb: messages::SetRGB,
 }
 pub struct SendDevice {
     descriptor: Arc<rusb::DeviceDescriptor>,
     id: Arc<Mutex<Option<messages::Id>>>,
+    meta_data: Arc<Mutex<Option<messages::MetaData>>>,
+    rgb: Arc<Mutex<messages::SetRGB>>,
 }
 impl SendDevice {
     pub async fn id(&self) -> Option<messages::Id> {
         self.id.lock().await.clone()
+    }
+    pub async fn meta_data(&self) -> Option<messages::MetaData> {
+        self.meta_data.lock().await.clone()
+    }
+    pub async fn rgb(&self) -> messages::SetRGB {
+        self.rgb.lock().await.clone()
     }
     pub fn descriptor(&self) -> &rusb::DeviceDescriptor {
         &self.descriptor
@@ -72,6 +82,8 @@ impl SendDevice {
         SerializableDevice{
             descriptor: format!("{:?}", self.descriptor),
             id: self.id().await,
+            meta_data: self.meta_data().await,
+            rgb: self.rgb().await,
         }
     }
 }
@@ -79,9 +91,13 @@ impl From<&Device> for SendDevice {
     fn from(device: &Device) -> Self {
         let descriptor = device.descriptor.clone();
         let id = device.id.clone();
+        let meta_data = device.meta_data.clone();
+        let rgb = device.rgb.clone();
         SendDevice{
             descriptor,
-            id
+            id,
+            meta_data,
+            rgb,
         }
     }
 }
@@ -91,11 +107,14 @@ struct Device{
     device_handle: Arc<rusb::DeviceHandle<rusb::GlobalContext>>,
     descriptor: Arc<rusb::DeviceDescriptor>,
     id: Arc<Mutex<Option<messages::Id>>>,
+    meta_data: Arc<Mutex<Option<messages::MetaData>>>,
+    rgb: Arc<Mutex<messages::SetRGB>>,
     rx_queue: tokio::sync::mpsc::Receiver<messages::RxMessage>,
     tx_close: tokio::sync::oneshot::Sender<()>,
     jh: tokio::task::JoinHandle<()>,
     tx_close_ping: tokio::sync::oneshot::Sender<()>,
     jh_ping: tokio::task::JoinHandle<()>,
+    capturing: bool,
 }
 
 impl Device {
@@ -103,6 +122,11 @@ impl Device {
         device: rusb::Device<rusb::GlobalContext>,
         descriptor: rusb::DeviceDescriptor
     ) -> anyhow::Result<Self> {
+        const CONNECTED_RGB: messages::SetRGB = messages::SetRGB{
+            r: 0,
+            g: 0,
+            b: 255,
+        };
         let descriptor = Arc::new(descriptor);
         let device_handle = match device.open() {
             Ok(v) => Arc::new(v),
@@ -118,6 +142,8 @@ impl Device {
         };
 
         let id = Arc::new(Mutex::new(None));
+        let meta_data = Arc::new(Mutex::new(None));
+        let rgb = Arc::new(Mutex::new(CONNECTED_RGB));
 
         let (tx, rx) = tokio::sync::mpsc::channel(1024);
         let (tx_close, rx_close) = tokio::sync::oneshot::channel();
@@ -150,6 +176,7 @@ impl Device {
         };
         let jh = {
             let id = id.clone();
+            let meta_data = meta_data.clone();
             let device_handle2 = device_handle.clone();
             tokio::task::spawn(async move{
                 let mut rx_close = rx_close;
@@ -188,12 +215,18 @@ impl Device {
                                     *lock = Some(new_id);
                                     continue;
                                 },
+                                Ok(messages::RxMessage::MetaData(new_meta_data)) => {
+                                    let mut lock = meta_data.lock().await;
+                                    *lock = Some(new_meta_data);
+                                    continue;
+                                },
                                 Ok(message) => message,
                                 Err(err) => {
                                     eprintln!("Failed to deserialize message: {err}");
                                     continue;
                                 }
                             };
+                            println!("Received message: {message:?}");
                             match tx.send(message).await {
                                 Ok(()) => (),
                                 Err(err) => {
@@ -213,19 +246,19 @@ impl Device {
             device_handle,
             descriptor,
             id,
+            meta_data,
+            rgb,
             rx_queue: rx,
             tx_close,
             jh,
             tx_close_ping,
             jh_ping,
+            capturing: false,
         };
 
         device.send(&messages::TxMessage::GetId)?;
-        device.send(&messages::TxMessage::SetRGB(messages::SetRGB{
-            r: 0,
-            g: 0,
-            b: 255,
-        }))?;
+        device.send(&messages::TxMessage::GetMetaData)?;
+        device.send(&messages::TxMessage::SetRGB(CONNECTED_RGB))?;
         Ok(device)
     }
 
@@ -240,8 +273,16 @@ impl Device {
     }
 
     #[inline]
-    pub fn send(&self, message: &messages::TxMessage) -> anyhow::Result<()> {
+    fn send(&self, message: &messages::TxMessage) -> anyhow::Result<()> {
         Self::send_internal(&self.device_handle, message)
+    }
+
+    pub fn stop_capture(&mut self) -> anyhow::Result<()> {
+        if self.capturing {
+            self.send(&messages::TxMessage::Stop)?;
+            self.capturing = false;
+        }
+        Ok(())
     }
     pub async fn id(&self) -> Option<messages::Id> {
         self.id.lock().await.clone()
@@ -252,6 +293,15 @@ impl Device {
 }
 impl Drop for Device {
     fn drop(&mut self) {
+        if self.capturing {
+            match self.stop_capture() {
+                Ok(()) => (),
+                Err(err) => {
+                    eprintln!("Failed to stop capture: {err}");
+                }
+            }
+        }
+
         let (mut tx, _) = tokio::sync::oneshot::channel();
         core::mem::swap(&mut self.tx_close, &mut tx);
         tx.send(()).ok();

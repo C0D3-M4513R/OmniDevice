@@ -1,9 +1,12 @@
 use std::time::Duration;
 use clap::Parser;
+use crate::device::DeviceList;
+use crate::options::Options;
 
 mod options;
 mod webserver;
 mod device;
+mod routes;
 
 const USB_VID: u16 = 0x2e8a;
 const USB_PID: u16 = 0x000a;
@@ -38,7 +41,30 @@ async fn main() {
             Err(err) => eprintln!("Error scanning for devices: {}", err),
         }
     }
+    if options.websocket() {
+        if options.port() == 0 {
+            eprintln!("Port must be greater than 0");
+            return;
+        }
+        if let Err(err) = run_websocket(options.clone(), device_list).await {
+            eprintln!("Error starting websocket server: {}", err);
+            return;
+        }
+    }
 }
 
-async fn run_websocket() {
+async fn run_websocket(option: Options, device_list: DeviceList) -> Result<rocket::Rocket<rocket::Ignite>, rocket::Error>{
+    let rocket = rocket::build();
+    let figment = rocket.figment().clone()
+                .merge((rocket::Config::PORT, option.port()));
+    rocket
+        .configure(figment)
+        .manage(device_list)
+        .mount("/", rocket::routes![
+            routes::get_devices,
+            routes::help,
+            routes::ws_impl,
+        ])
+        .launch()
+        .await
 }
