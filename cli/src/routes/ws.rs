@@ -16,21 +16,33 @@ pub async fn ws_impl(device_list: &rocket::State<crate::DeviceList>, ws: rocket_
                 sampling_rate: None,
                 format: None,
             };
-            let mut iteration = 0;
-            for i in value.rsplit(" ") {
-                if iteration <= 1 {
-                    if let Ok(v) = i.parse::<u32>() {
+            let mut vec: Vec<_> = value.rsplit(" ").collect();
+            let last = vec.pop();
+            let last_2nd = vec.pop();
+            match (last, last_2nd) {
+                (Some(last), Some(last_2nd)) => {
+                    if let Ok(v) = last.parse::<u32>() {
                         config.sampling_rate = Some(v);
+                        config.uuid.push(last_2nd.to_string());
                     } else {
-                        if iteration == 0 {
-                            config.format = Some(i.to_string());
+                        if let Ok(v) = last_2nd.parse::<u32>() {
+                            config.sampling_rate = Some(v);
+                            config.format = Some(last.to_string());
+                        } else {
+                            config.uuid.push(last.to_string());
+                            config.uuid.push(last_2nd.to_string());
                         }
                     }
-                } else {
-                    config.uuid.push(i.to_string());
-                }
-                iteration += 1;
+                },
+                (Some(last), None) => {
+                    config.uuid.push(last.to_string());
+                },
+                (None, Some(last_2nd)) => {
+                    panic!("didn't get last element, but got second last?");
+                },
+                (None, None) => {}
             }
+            config.uuid.extend(vec.into_iter().map(|v|v.to_string()));
             config
         }
     }
@@ -68,6 +80,32 @@ pub async fn ws_impl(device_list: &rocket::State<crate::DeviceList>, ws: rocket_
                     };
                     match message {
                         rocket_ws::Message::Text(text) => {
+                            let config = DeviceConfig::from(text.clone());
+                            let mut set:std::collections::HashSet<_> = config.uuid.iter().collect();
+                            for device in device_list.list_send() {
+                                let id = match device.id().await {
+                                    Some(id) => id,
+                                    None => continue,
+                                };
+                                set.remove(id.serial());
+                            }
+
+                            if set.is_empty() {
+                                for device in device_list.list() {
+                                    let id = match device.id().await {
+                                        Some(id) => id,
+                                        None => continue,
+                                    };
+                                    match device.start_capture().await {
+                                        Ok(_) => {
+                                            println!("Started capture for device: {}", id.serial());
+                                        }
+                                        Err(err) => {
+                                            eprintln!("Error starting capture for device {}: {}", id.serial(), err);
+                                        }
+                                    }
+                                }
+                            }
                             println!("Received message: {text}");
                         },
                         rocket_ws::Message::Pong(pong) => {

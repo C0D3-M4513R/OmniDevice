@@ -114,7 +114,7 @@ struct Device{
     jh: tokio::task::JoinHandle<()>,
     tx_close_ping: tokio::sync::oneshot::Sender<()>,
     jh_ping: tokio::task::JoinHandle<()>,
-    capturing: bool,
+     capturing: std::sync::atomic::AtomicBool,
 }
 
 impl Device {
@@ -253,7 +253,7 @@ impl Device {
             jh,
             tx_close_ping,
             jh_ping,
-            capturing: false,
+            capturing: std::sync::atomic::AtomicBool::new(false),
         };
 
         device.send(&messages::TxMessage::GetId)?;
@@ -277,10 +277,30 @@ impl Device {
         Self::send_internal(&self.device_handle, message)
     }
 
-    pub fn stop_capture(&mut self) -> anyhow::Result<()> {
-        if self.capturing {
-            self.send(&messages::TxMessage::Stop)?;
-            self.capturing = false;
+    pub fn start_capture(&self) -> anyhow::Result<()> {
+        if self.capturing.compare_exchange(false, true, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire).is_ok() {
+            match self.send(&messages::TxMessage::Start) {
+                Ok(()) => (),
+                Err(err) => {
+                    eprintln!("Failed to start capture: {err}");
+                    self.capturing.store(false, std::sync::atomic::Ordering::Release);
+                    return Err(err);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn stop_capture(&self) -> anyhow::Result<()> {
+        if self.capturing.compare_exchange(true, false, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire).is_ok() {
+            match self.send(&messages::TxMessage::Stop) {
+                Ok(()) => (),
+                Err(err) => {
+                    eprintln!("Failed to stop capture: {err}");
+                    self.capturing.store(true, std::sync::atomic::Ordering::Release);
+                    return Err(err);
+                }
+            }
         }
         Ok(())
     }
