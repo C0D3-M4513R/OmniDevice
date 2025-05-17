@@ -1,5 +1,7 @@
+use std::sync::Arc;
 use std::time::Duration;
 use clap::Parser;
+use tokio::sync::RwLock;
 use crate::device::DeviceList;
 use crate::options::Options;
 
@@ -11,6 +13,7 @@ mod routes;
 const USB_VID: u16 = 0x2e8a;
 const USB_PID: u16 = 0x000a;
 const MAX_MESSAGE_SIZE: u16 = 2_u16.pow(12);
+const MAX_MESSAGE_BUF: u32 = 2_u32.pow(15);
 
 #[rocket::main]
 async fn main() {
@@ -59,7 +62,7 @@ async fn run_websocket(option: Options, device_list: DeviceList) -> Result<rocke
                 .merge((rocket::Config::PORT, option.port()));
     rocket
         .configure(figment)
-        .manage(device_list)
+        .manage(Arc::new(RwLock::new(device_list)))
         .mount("/", rocket::routes![
             routes::get_devices,
             routes::help,

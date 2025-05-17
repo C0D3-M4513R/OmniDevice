@@ -1,10 +1,10 @@
-mod messages;
+pub mod messages;
 
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::time::MissedTickBehavior;
-use crate::{MAX_MESSAGE_SIZE, USB_PID, USB_VID};
+use crate::{MAX_MESSAGE_BUF, MAX_MESSAGE_SIZE, USB_PID, USB_VID};
 
 pub(super) struct DeviceList {
     list: Vec<Device>
@@ -22,13 +22,25 @@ impl DeviceList {
         };
         self.list.reserve(device_list.len());
         for device in device_list.iter() {
+            let bus_number = device.bus_number();
+            let address = device.address();
+            let port_number = device.port_number();
             let descriptor = match device.device_descriptor() {
                 Ok(v) => v,
                 Err(err) => {
-                    eprintln!("Failed to get device descriptor: {err}");
+                    eprintln!("Failed to get device descriptor(bus =  {}, address = {}, port_number= {}): {err}", bus_number, address, port_number);
                     continue;
                 }
             };
+            if self.list.iter().any(|v|{
+                let device = v.device_handle.device();
+                device.bus_number() == bus_number &&
+                    device.address() == address &&
+                    device.port_number() == port_number
+            }) {
+                eprintln!("Skipping probably already connected device(bus =  {}, address = {}, port_number= {})", bus_number, address, port_number);
+                continue;
+            }
             if descriptor.vendor_id() != USB_VID || descriptor.product_id() != USB_PID {
                 continue;
             }
@@ -37,7 +49,7 @@ impl DeviceList {
                     self.list.push(device);
                 }
                 Err(err) => {
-                    eprintln!("Failed to create device: {err}");
+                    eprintln!("Failed to create device(bus =  {}, address = {}, port_number= {}): {err}", bus_number, address, port_number);
                 }
             };
         }
@@ -61,13 +73,18 @@ pub struct SerializableDevice {
 }
 pub struct SendDevice {
     descriptor: Arc<rusb::DeviceDescriptor>,
+    rx_queue: tokio::sync::broadcast::Receiver<messages::MeasureData>,
     id: Arc<Mutex<Option<messages::Id>>>,
     meta_data: Arc<Mutex<Option<messages::MetaData>>>,
     rgb: Arc<Mutex<messages::SetRGB>>,
+    users: Arc<Mutex<Vec<u64>>>,
 }
 impl SendDevice {
     pub async fn id(&self) -> Option<messages::Id> {
         self.id.lock().await.clone()
+    }
+    pub fn rx_queue(&self) -> &tokio::sync::broadcast::Receiver<messages::MeasureData> {
+        &self.rx_queue
     }
     pub async fn meta_data(&self) -> Option<messages::MetaData> {
         self.meta_data.lock().await.clone()
@@ -90,31 +107,54 @@ impl SendDevice {
 impl From<&Device> for SendDevice {
     fn from(device: &Device) -> Self {
         let descriptor = device.descriptor.clone();
+        let rx_queue = device.rx_queue.resubscribe();
         let id = device.id.clone();
         let meta_data = device.meta_data.clone();
         let rgb = device.rgb.clone();
-        SendDevice{
+        let users = device.users.clone();
+        Self{
             descriptor,
+            rx_queue,
             id,
             meta_data,
             rgb,
+            users,
+        }
+    }
+}
+impl Clone for SendDevice {
+    fn clone(&self) -> Self {
+        let descriptor = self.descriptor.clone();
+        let rx_queue = self.rx_queue.resubscribe();
+        let id = self.id.clone();
+        let meta_data = self.meta_data.clone();
+        let rgb = self.rgb.clone();
+        let users = self.users.clone();
+        Self{
+            descriptor,
+            rx_queue,
+            id,
+            meta_data,
+            rgb,
+            users,
         }
     }
 }
 
-struct Device{
+pub struct Device{
     device: rusb::Device<rusb::GlobalContext>,
     device_handle: Arc<rusb::DeviceHandle<rusb::GlobalContext>>,
     descriptor: Arc<rusb::DeviceDescriptor>,
     id: Arc<Mutex<Option<messages::Id>>>,
     meta_data: Arc<Mutex<Option<messages::MetaData>>>,
     rgb: Arc<Mutex<messages::SetRGB>>,
-    rx_queue: tokio::sync::mpsc::Receiver<messages::RxMessage>,
+    rx_queue: tokio::sync::broadcast::Receiver<messages::MeasureData>,
     tx_close: tokio::sync::oneshot::Sender<()>,
     jh: tokio::task::JoinHandle<()>,
     tx_close_ping: tokio::sync::oneshot::Sender<()>,
     jh_ping: tokio::task::JoinHandle<()>,
-     capturing: std::sync::atomic::AtomicBool,
+    capturing: std::sync::atomic::AtomicBool,
+    users: Arc<Mutex<Vec<u64>>>,
 }
 
 impl Device {
@@ -144,8 +184,9 @@ impl Device {
         let id = Arc::new(Mutex::new(None));
         let meta_data = Arc::new(Mutex::new(None));
         let rgb = Arc::new(Mutex::new(CONNECTED_RGB));
+        let users = Arc::new(Mutex::new(Vec::new()));
 
-        let (tx, rx) = tokio::sync::mpsc::channel(1024);
+        let (tx, rx) = tokio::sync::broadcast::channel(1024);
         let (tx_close, rx_close) = tokio::sync::oneshot::channel();
         let (tx_close_ping, rx_close_ping) = tokio::sync::oneshot::channel();
         let jh_ping = {
@@ -220,20 +261,20 @@ impl Device {
                                     *lock = Some(new_meta_data);
                                     continue;
                                 },
-                                Ok(message) => message,
+                                Ok(messages::RxMessage::MeasureData(measure_data)) => {
+                                    match tx.send(measure_data) {
+                                        Ok(_) => (),
+                                        Err(err) => {
+                                            eprintln!("Failed to send message to channel: {err}");
+                                            continue;
+                                        }
+                                    }
+                                },
                                 Err(err) => {
                                     eprintln!("Failed to deserialize message: {err}");
                                     continue;
                                 }
                             };
-                            println!("Received message: {message:?}");
-                            match tx.send(message).await {
-                                Ok(()) => (),
-                                Err(err) => {
-                                    eprintln!("Failed to send message to channel: {err}");
-                                    break;
-                                }
-                            }
                         }
                     }
                 }
@@ -254,6 +295,7 @@ impl Device {
             tx_close_ping,
             jh_ping,
             capturing: std::sync::atomic::AtomicBool::new(false),
+            users,
         };
 
         device.send(&messages::TxMessage::GetId)?;
@@ -310,10 +352,17 @@ impl Device {
     pub fn descriptor(&self) -> &rusb::DeviceDescriptor {
         &self.descriptor
     }
+    pub async fn meta_data(&self) -> Option<messages::MetaData> {
+        self.meta_data.lock().await.clone()
+    }
+    pub const fn rx_queue(&self) -> &tokio::sync::broadcast::Receiver<messages::MeasureData> {
+        &self.rx_queue
+    }
+
 }
 impl Drop for Device {
     fn drop(&mut self) {
-        if self.capturing {
+        if *self.capturing.get_mut() {
             match self.stop_capture() {
                 Ok(()) => (),
                 Err(err) => {

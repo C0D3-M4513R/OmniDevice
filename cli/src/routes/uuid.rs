@@ -1,3 +1,6 @@
+use std::sync::Arc;
+use tokio::sync::RwLock;
+
 #[derive(serde_derive::Serialize, serde_derive::Deserialize)]
 struct Devices{
     devices: Vec<Device>,
@@ -19,7 +22,16 @@ struct Color{
     b: u32,
 }
 #[rocket::get("/UUID")]
-pub async fn get_devices(device_list: &rocket::State<crate::DeviceList>) -> Result<String, String> {
+pub async fn get_devices(device_list: &rocket::State<Arc<RwLock<crate::DeviceList>>>) -> Result<String, String> {
+    let mut device_list = device_list.write().await;
+    match device_list.scan_for_new_devices().await {
+        Ok(()) => {},
+        Err(e) => {
+            return Err(format!("Error scanning for devices: {e}"));
+        }
+    }
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    let device_list = device_list.downgrade();
     let send_list = device_list.list_send();
     let mut devices = Vec::new();
     let mut colors = Vec::new();

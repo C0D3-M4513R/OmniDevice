@@ -19,7 +19,7 @@ pub enum MessageType {
     MetaData = 2,
 }
 #[repr(u8)]
-#[derive(Debug, serde_derive::Deserialize, serde_derive::Serialize)]
+#[derive(Debug, Clone, serde_derive::Deserialize, serde_derive::Serialize)]
 pub enum RxMessage {
     Id(Id) = 0,
     MeasureData(MeasureData) = 1,
@@ -42,15 +42,32 @@ impl Id {
     pub const fn sw_version(&self) -> Version { self.sw_version }
     pub const fn sw_git_hash(&self) -> &String { &self.sw_git_hash }
 }
-#[derive(Debug, serde_derive::Deserialize, serde_derive::Serialize)]
+#[derive(Debug, Clone, serde_derive::Deserialize, serde_derive::Serialize, Ord, PartialOrd, Eq, PartialEq)]
 pub struct StartOfFrame{
     content: u16,
 }
-#[derive(Debug, serde_derive::Deserialize, serde_derive::Serialize)]
+impl StartOfFrame {
+    pub const DEFAULT: Self = Self { content: 0 };
+    pub const fn content(&self) -> u16 { self.content }
+}
+impl Default for StartOfFrame {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+#[derive(Debug, Clone, serde_derive::Deserialize, serde_derive::Serialize)]
 pub struct MeasureData{
     package_counter: u8,
     sof: StartOfFrame,
     data: Vec<u16>,
+}
+impl MeasureData {
+    pub const fn package_counter(&self) -> u8 { self.package_counter }
+    pub const fn sof(&self) -> &StartOfFrame { &self.sof }
+    pub const fn counter(&self) -> u32 {
+        (self.sof.content as u32) << 2 | self.package_counter as u32 & 0b11
+    }
+    pub const fn data(&self) -> &Vec<u16> { &self.data }
 }
 #[derive(Debug, Clone, serde_derive::Deserialize, serde_derive::Serialize)]
 pub struct MetaData{
