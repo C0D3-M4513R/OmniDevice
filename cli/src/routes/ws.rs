@@ -216,6 +216,8 @@ pub async fn ws_impl(shutdown: rocket::Shutdown, device_list: &rocket::State<Arc
                                 set.remove(id.serial());
                                 subscribed_devices.push(device);
                             }
+
+                            //Todo: Support multiple devices
                             if subscribed_devices.len() > 1 {
                                 if let Err(err) = stream.close(Some(rocket_ws::frame::CloseFrame {
                                     code: rocket_ws::frame::CloseCode::Invalid,
