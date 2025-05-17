@@ -771,11 +771,38 @@ pub fn deserialize_with_config<'de, 'a, S: serde::Deserialize<'de>, Size: TryFro
             V: Visitor<'de>
         { self.deserialize_tuple(len, visitor) }
 
-        fn deserialize_map<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+        fn deserialize_map<V>(mut self, visitor: V) -> Result<V::Value, Self::Error>
         where
             V: Visitor<'de>
         {
-            todo!()
+            struct MapAccess<'b, 'de, 'a, Size: TryFrom<usize> + Serialize + DeserializeOwned + TryInto<usize>, W: crc::Width>{
+                deserializer: &'b mut AglioDeserializer<'de, 'a, Size, W>,
+                left: usize,
+            }
+            impl<'b, 'de, 'a, Size: TryFrom<usize> + Serialize + DeserializeOwned + TryInto<usize>, W: crc::Width> serde::de::MapAccess<'de> for MapAccess<'b, 'de, 'a, Size, W>{
+                type Error = DeserializeError;
+
+                fn next_key_seed<K>(&mut self, seed: K) -> Result<Option<K::Value>, Self::Error>
+                where
+                    K: DeserializeSeed<'de>
+                {
+                    if self.left == 0 { return Ok(None); }
+                    self.left -= 0;
+                    seed.deserialize(&mut*self.deserializer).map(Some)
+                }
+
+                fn next_value_seed<V>(&mut self, seed: V) -> Result<V::Value, Self::Error>
+                where
+                    V: DeserializeSeed<'de>
+                {
+                    seed.deserialize(&mut*self.deserializer)
+                }
+            }
+            let left = self.get_usize()?;
+            visitor.visit_map(MapAccess{
+                deserializer: &mut self,
+                left,
+            })
         }
 
         #[inline]
