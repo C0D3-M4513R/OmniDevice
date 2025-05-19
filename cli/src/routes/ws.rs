@@ -179,7 +179,7 @@ pub async fn ws_impl(shutdown: rocket::Shutdown, device_list: &rocket::State<Arc
 
                     if message.counter() % 50 != 0 { continue; }
                     let timestamp = std::time::UNIX_EPOCH.elapsed().unwrap_or(Duration::ZERO) //Get the current time
-                        .saturating_mul(1000) //new Data(number) uses milliseconds. Multiply first, then convert to floating-point, to not unessesarily lose precision
+                        .saturating_mul(1000) //new Data(number) uses milliseconds. Multiply first, then convert to floating-point, to not unnecessarily lose precision
                         .as_secs_f64(); //and then convert to floating-point
                     measure_data.extend(message.data().iter().map(|value|WSMeasurementData{
                             timestamp,
