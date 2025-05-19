@@ -1,11 +1,8 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::Duration;
-use rocket::futures::stream::FusedStream;
-use rusb::ffi::libusb_hotplug_deregister_callback;
 use serde_with::serde_as;
 use tokio::sync::RwLock;
-use tokio::time::Instant;
 use crate::device::messages::MeasureData;
 use crate::device::SendDevice;
 use crate::MAX_MESSAGE_BUF;
@@ -25,14 +22,20 @@ struct WSMeasurementData{
 #[rocket::get("/ws")]
 pub async fn ws_impl(shutdown: rocket::Shutdown, device_list: &rocket::State<Arc<RwLock<crate::DeviceList>>>, ws: rocket_ws::WebSocket) -> rocket_ws::Channel<'static> {
     #[derive(Clone, serde_derive::Serialize, serde_derive::Deserialize)]
-    #[serde(from="String", into="String")]
-    struct DeviceConfig{
-        uuid: Vec<String>,
-        sampling_rate: Option<u32>,
-        format: Option<String>,
+    struct DownsampleRequest{
+        command: String,
+        tmin: chrono::DateTime<chrono::FixedOffset>,
+        tmax: chrono::DateTime<chrono::FixedOffset>,
+        desired_number_of_samples: u128
     }
-    impl From<String> for DeviceConfig {
-        fn from(value: String) -> Self {
+    #[derive(Clone)]
+    struct DeviceConfig<'a>{
+        uuid: Vec<&'a str>,
+        sampling_rate: Option<u32>,
+        format: Option<&'a str>,
+    }
+    impl<'a> From<&'a str> for DeviceConfig<'a> {
+        fn from(value: &'a str) -> Self {
             let mut config = DeviceConfig{
                 uuid: Vec::new(),
                 sampling_rate: None,
@@ -45,38 +48,39 @@ pub async fn ws_impl(shutdown: rocket::Shutdown, device_list: &rocket::State<Arc
                 (Some(last), Some(last_2nd)) => {
                     if let Ok(v) = last.parse::<u32>() {
                         config.sampling_rate = Some(v);
-                        config.uuid.push(last_2nd.to_string());
+                        config.uuid.push(last_2nd);
                     } else {
                         if let Ok(v) = last_2nd.parse::<u32>() {
                             config.sampling_rate = Some(v);
-                            config.format = Some(last.to_string());
+                            config.format = Some(last);
                         } else {
-                            config.uuid.push(last.to_string());
-                            config.uuid.push(last_2nd.to_string());
+                            config.uuid.push(last);
+                            config.uuid.push(last_2nd);
                         }
                     }
                 },
                 (Some(last), None) => {
-                    config.uuid.push(last.to_string());
+                    config.uuid.push(last);
                 },
                 (None, Some(_)) => {
                     panic!("didn't get last element, but got second last?");
                 },
                 (None, None) => {}
             }
-            config.uuid.extend(vec.into_iter().map(|v|v.to_string()));
+            config.uuid.append(&mut vec);
             config
         }
     }
-    impl From<DeviceConfig> for String {
+    impl From<DeviceConfig<'_>> for String {
         fn from(value: DeviceConfig) -> Self {
             let mut out = value.uuid.join(" ");
             if let Some(sampling_rate) = value.sampling_rate {
-                out.push_str(&format!(" {sampling_rate}"));
+                out.push(' ');
+                out.push_str(&sampling_rate.to_string());
             }
             if let Some(format) = value.format {
                 out.push(' ');
-                out.push_str(&format);
+                out.push_str(format);
             }
             out
         }
@@ -89,7 +93,7 @@ pub async fn ws_impl(shutdown: rocket::Shutdown, device_list: &rocket::State<Arc
     #[derive(serde_derive::Serialize, serde_derive::Deserialize)]
     #[serde(untagged)]
     enum Messages{
-        DeviceConfig(DeviceConfig),
+        DownsampleRequest(DownsampleRequest),
     }
     use rocket::futures::{SinkExt, StreamExt};
     let device_list = device_list.inner().clone();
@@ -121,7 +125,10 @@ pub async fn ws_impl(shutdown: rocket::Shutdown, device_list: &rocket::State<Arc
                         let reason = $reason;
                         let err = $err;
                         merge_err!(err, &reason);
-                        rx = None;
+                        #[allow(unused_assignments)]
+                        {
+                            rx = None;
+                        }
                         if let Err(err) = stream.close(Some(rocket_ws::frame::CloseFrame {
                             code: rocket_ws::frame::CloseCode::Invalid,
                             reason: (&reason).into(),
@@ -138,7 +145,10 @@ pub async fn ws_impl(shutdown: rocket::Shutdown, device_list: &rocket::State<Arc
             tokio::select! {
                 _ = &mut shutdown => {
                     println!("Shutdown requested");
-                    rx = None;
+                    #[allow(unused_assignments)]
+                    {
+                        rx = None;
+                    }
                     if let Err(err) = stream.close(Some(rocket_ws::frame::CloseFrame {
                         code: rocket_ws::frame::CloseCode::Restart,
                         reason: "The server is Shutting Down".into(),
@@ -170,9 +180,8 @@ pub async fn ws_impl(shutdown: rocket::Shutdown, device_list: &rocket::State<Arc
                     }),
                     None => None
                 }}, if rx.is_some() => {
-                    let devices = message.uuids;
-                    let (message, rx) = message.rx;
-                    let (id, message) = match message{
+                    let (message, _) = message.rx;
+                    let (_, message) = match message{
                         Some(v) => v,
                         None => continue,
                     };
@@ -197,111 +206,114 @@ pub async fn ws_impl(shutdown: rocket::Shutdown, device_list: &rocket::State<Arc
                     };
                     match message {
                         rocket_ws::Message::Text(text) => {
-                            let config:DeviceConfig = match serde_json::from_str(text.as_str()) {
-                                Ok(v) => v,
-                                Err(err) => {
-                                    eprintln!("error deserializing message '{text}': {}", err);
-                                    result = Some(Err(rocket_ws::result::Error::Io(std::io::Error::new(std::io::ErrorKind::Other, err))));
-                                    break;
-                                }
-                            };
-                            let mut set:std::collections::HashSet<_> = config.uuid.iter().collect();
-                            let device_list = device_list.read().await;
-                            let mut subscribed_devices = Vec::new();
-                            for device in device_list.list() {
-                                let id = match device.id().await {
-                                    Some(id) => id,
-                                    None => continue,
-                                };
-                                set.remove(id.serial());
-                                subscribed_devices.push(device);
-                            }
-
-                            //Todo: Support multiple devices
-                            if subscribed_devices.len() > 1 {
-                                if let Err(err) = stream.close(Some(rocket_ws::frame::CloseFrame {
-                                    code: rocket_ws::frame::CloseCode::Invalid,
-                                    reason: format!("Subscribed to too many devices. Currently only one device is supported. You tried to subscribe to {} devices", subscribed_devices.len()).into(),
-                                })).await {
-                                    eprintln!("error closing websocket: {}", err);
-                                    result = Some(Err(err));
-                                    break;
-                                }
-                            }
-
-                            if !set.is_empty() {
-                                if let Err(err) = stream.close(Some(rocket_ws::frame::CloseFrame {
-                                    code: rocket_ws::frame::CloseCode::Invalid,
-                                    reason: format!("Device(s) not found: {}", set.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(", ")).into(),
-                                })).await {
-                                    eprintln!("error closing websocket: {}", err);
-                                    result = Some(Err(err));
-                                    break;
-                                }
-                            } else {
-                                let (tx, rx_) = tokio::sync::mpsc::channel(MAX_MESSAGE_BUF as usize*8);
-                                let mut devices = Vec::new();
-                                for (i, device) in subscribed_devices.into_iter().enumerate() {
-                                    let id = match device.id().await {
-                                        Some(id) => id,
-                                        None => {
-                                            result = Some(match stream.close(Some(rocket_ws::frame::CloseFrame {
-                                                code: rocket_ws::frame::CloseCode::Invalid,
-                                                reason: Cow::Borrowed("Device only had an id spuriously?"),
-                                            })).await {
-                                                Ok(_) => Ok(()),
-                                                Err(err) => {
-                                                    eprintln!("error closing websocket: {}", err);
-                                                    Err(err)
-                                                }
-                                            });
-                                            break;
-                                        },
-                                    };
-                                    println!("Subscribing to device: {}", id.serial());
-
-                                    devices.push(id.serial().clone());
-                                    let tx = tx.clone();
-                                    {
-                                        let device = SendDevice::from(device);
-                                        js.spawn(async move {
-                                            let mut rx = device.rx_queue().resubscribe();
-                                            loop {
-                                                match rx.recv().await {
-                                                    Ok(message) => {
-                                                        if let Err(err) = tx.send((i, message)).await {
-                                                            eprintln!("error sending message: {}", err);
-                                                            break;
-                                                        }
-                                                    }
-                                                    Err(tokio::sync::broadcast::error::RecvError::Lagged(num)) => {
-                                                        eprintln!("Lagged {num} messages");
-                                                        continue;
-                                                    }
-                                                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                                                        println!("Device disconnected");
-                                                        break;
-                                                    }
-                                                }
-                                            }
-                                        });
+                            match serde_json::from_str::<Messages>(text.as_str()) {
+                                Ok(Messages::DownsampleRequest(rq)) => {
+                                    if rq.command != "get_downsampled_in_range" {
+                                        error!(Err(rocket_ws::result::Error::Io(std::io::Error::new(std::io::ErrorKind::Other, "Unknown command"))), err, format!("Unknown command: {}", rq.command));
                                     }
-                                    match tokio::task::block_in_place(||device.start_capture()) {
-                                        Ok(_) => {},
-                                        Err(err) => {
-                                            eprintln!("error starting capture: {err}");
-                                            let err = rocket_ws::result::Error::Io(std::io::Error::new(std::io::ErrorKind::Other, err));
-                                            error!(Err(err), err, format!("error starting capture: {err}"));
+                                    //Todo: Implement downsampling
+                                },
+                                Err(_) => {
+                                    let config = DeviceConfig::from(text.as_str());
+                                    let mut set:std::collections::HashSet<_> = config.uuid.iter().copied().collect();
+                                    let device_list = device_list.read().await;
+                                    let mut subscribed_devices = Vec::new();
+                                    for device in device_list.list() {
+                                        let id = match device.id().await {
+                                            Some(id) => id,
+                                            None => continue,
+                                        };
+                                        set.remove(id.serial().as_str());
+                                        subscribed_devices.push(device);
+                                    }
+
+                                    //Todo: Support multiple devices
+                                    if subscribed_devices.len() > 1 {
+                                        if let Err(err) = stream.close(Some(rocket_ws::frame::CloseFrame {
+                                            code: rocket_ws::frame::CloseCode::Invalid,
+                                            reason: format!("Subscribed to too many devices. Currently only one device is supported. You tried to subscribe to {} devices", subscribed_devices.len()).into(),
+                                        })).await {
+                                            eprintln!("error closing websocket: {}", err);
+                                            result = Some(Err(err));
+                                            break;
                                         }
                                     }
+
+                                    if !set.is_empty() {
+                                        if let Err(err) = stream.close(Some(rocket_ws::frame::CloseFrame {
+                                            code: rocket_ws::frame::CloseCode::Invalid,
+                                            reason: format!("Device(s) not found: {}", set.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(", ")).into(),
+                                        })).await {
+                                            eprintln!("error closing websocket: {}", err);
+                                            result = Some(Err(err));
+                                            break;
+                                        }
+                                    } else {
+                                        let (tx, rx_) = tokio::sync::mpsc::channel(MAX_MESSAGE_BUF as usize*8);
+                                        let mut devices = Vec::new();
+                                        for (i, device) in subscribed_devices.into_iter().enumerate() {
+                                            let id = match device.id().await {
+                                                Some(id) => id,
+                                                None => {
+                                                    result = Some(match stream.close(Some(rocket_ws::frame::CloseFrame {
+                                                        code: rocket_ws::frame::CloseCode::Invalid,
+                                                        reason: Cow::Borrowed("Device only had an id spuriously?"),
+                                                    })).await {
+                                                        Ok(_) => Ok(()),
+                                                        Err(err) => {
+                                                            eprintln!("error closing websocket: {}", err);
+                                                            Err(err)
+                                                        }
+                                                    });
+                                                    break;
+                                                },
+                                            };
+                                            println!("Subscribing to device: {}", id.serial());
+
+                                            devices.push(id.serial().clone());
+                                            let tx = tx.clone();
+                                            {
+                                                let device = SendDevice::from(device);
+                                                js.spawn(async move {
+                                                    let mut rx = device.rx_queue().resubscribe();
+                                                    loop {
+                                                        match rx.recv().await {
+                                                            Ok(message) => {
+                                                                if let Err(err) = tx.send((i, message)).await {
+                                                                    eprintln!("error sending message: {}", err);
+                                                                    break;
+                                                                }
+                                                            }
+                                                            Err(tokio::sync::broadcast::error::RecvError::Lagged(num)) => {
+                                                                eprintln!("Lagged {num} messages");
+                                                                continue;
+                                                            }
+                                                            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                                                println!("Device disconnected");
+                                                                break;
+                                                            }
+                                                        }
+                                                    }
+                                                });
+                                            }
+                                            match tokio::task::block_in_place(||device.start_capture()) {
+                                                Ok(_) => {},
+                                                Err(err) => {
+                                                    eprintln!("error starting capture: {err}");
+                                                    let err = rocket_ws::result::Error::Io(std::io::Error::new(std::io::ErrorKind::Other, err));
+                                                    error!(Err(err), err, format!("error starting capture: {err}"));
+                                                }
+                                            }
+                                        }
+                                        rx = Some(Measure{
+                                            uuids: devices,
+                                            rx: rx_
+                                        });
+                                        let mut interval = tokio::time::interval(Duration::from_millis(500));
+                                        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                                        timer = Some(interval);
+                                    }
                                 }
-                                rx = Some(Measure{
-                                    uuids: devices,
-                                    rx: rx_
-                                });
-                                let mut interval = tokio::time::interval(Duration::from_millis(500));
-                                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                                timer = Some(interval);
                             }
 
                             println!("Received message: {text}");
@@ -331,7 +343,10 @@ pub async fn ws_impl(shutdown: rocket::Shutdown, device_list: &rocket::State<Arc
                 }
             }
         }
-        rx = None; // dropping the receiver should make the tasks in the join-set stop, as soon as they have a new message themselves.
+        #[allow(unused_assignments)]
+        {
+            rx = None; // dropping the receiver should make the tasks in the join-set stop, as soon as they have a new message themselves.
+        }
         js.abort_all();
         while let Some(join) = js.join_next().await {
             match join {

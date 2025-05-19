@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::time::MissedTickBehavior;
-use crate::{MAX_MESSAGE_BUF, MAX_MESSAGE_SIZE, USB_PID, USB_VID};
+use crate::{MAX_MESSAGE_SIZE, USB_PID, USB_VID};
 
 pub(super) struct DeviceList {
     list: Vec<Device>
@@ -250,7 +250,7 @@ impl Device {
                                     break;
                                 }
                             };
-                            let message = match aglio::deserialize(buf) {
+                            match aglio::deserialize(buf) {
                                 Ok(messages::RxMessage::Id(new_id)) => {
                                     let mut lock = id.lock().await;
                                     *lock = Some(new_id);
